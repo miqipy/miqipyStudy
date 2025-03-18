@@ -1,0 +1,493 @@
+#import <AVFoundation/AVFoundation.h>
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <AVKit/AVKit.h>
+#import <Photos/Photos.h>
+
+// 共享全局变量
+static AVPlayer *sharedPlayer;
+static NSString *videoPath;
+static BOOL didHookDelegate = NO;
+
+// ============================
+// 视频文件管理
+// ============================
+
+// 获取视频路径，不复制文件以避免沙盒权限问题
+void prepareVideoFile() {
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSString *sourceFile = @"/var/mobile/Media/DCIM/100APPLE/IMG_0001.MP4"; // 主要视频源
+    NSString *backupSource = @"/var/mobile/Media/DCIM/100APPLE/IMG_0001.MP4"; // 备用视频源
+    
+    // 直接使用原始视频路径，而不是复制到临时目录
+    if ([fileManager fileExistsAtPath:sourceFile]) {
+        videoPath = sourceFile;
+        NSLog(@"[CameraVideoTweak] Using primary source at original location: %@", videoPath);
+    } else if ([fileManager fileExistsAtPath:backupSource]) {
+        videoPath = backupSource;
+        NSLog(@"[CameraVideoTweak] Using backup source at original location: %@", videoPath);
+    } else {
+        NSLog(@"[CameraVideoTweak] ERROR: No video source found!");
+        // 使用一个默认路径，以避免空指针
+        videoPath = @"/var/mobile/Media/DCIM/100APPLE/IMG_0001.MP4";
+    }
+    
+    // 检查文件是否存在和大小
+    if ([fileManager fileExistsAtPath:videoPath]) {
+        NSDictionary *attrs = [fileManager attributesOfItemAtPath:videoPath error:nil];
+        NSLog(@"[CameraVideoTweak] Video file found at: %@, size: %@ bytes", 
+              videoPath, [attrs objectForKey:NSFileSize]);
+    } else {
+        NSLog(@"[CameraVideoTweak] WARNING: Video file not accessible!");
+    }
+}
+
+// ============================
+// 视频处理类
+// ============================
+
+@interface VirtualCameraReplacer : NSObject
++ (void)setupReader;
++ (CMSampleBufferRef)getNextFrameBuffer;
++ (void)resetReader;
+@end
+
+@implementation VirtualCameraReplacer
+
+static AVAssetReader *reader = nil;
+static AVAssetReaderTrackOutput *output = nil;
+static BOOL isSetup = NO;
+
++ (void)setupReader {
+    if (isSetup) return;  // 避免重复初始化
+    
+    // 添加错误处理和容错机制
+    @try {
+        // 判断当前应用是否为 Safari 浏览器
+        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+        
+        NSURL *url = [NSURL fileURLWithPath:videoPath];
+        NSLog(@"[CameraVideoReplacer] Loading video from %@ in app: %@", url.path, bundleID);
+        
+        // 使用更安全的初始化方式
+        NSDictionary *options = @{AVURLAssetPreferPreciseDurationAndTimingKey: @YES};
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:options];
+        
+        // 等待资产加载元数据完成
+        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+        [asset loadValuesAsynchronouslyForKeys:@[@"tracks"] completionHandler:^{
+            dispatch_semaphore_signal(semaphore);
+        }];
+        
+        // 设置超时，以防止长时间阻塞
+        dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC);
+        if (dispatch_semaphore_wait(semaphore, timeout) != 0) {
+            NSLog(@"[CameraVideoReplacer] Timeout waiting for asset to load");
+            return;
+        }
+        
+        NSError *trackError = nil;
+        AVKeyValueStatus status = [asset statusOfValueForKey:@"tracks" error:&trackError];
+        if (status != AVKeyValueStatusLoaded) {
+            NSLog(@"[CameraVideoReplacer] Failed to load asset tracks: %@", trackError);
+            return;
+        }
+        
+        NSError *readerError = nil;
+        reader = [[AVAssetReader alloc] initWithAsset:asset error:&readerError];
+        
+        if (readerError) {
+            NSLog(@"[CameraVideoReplacer] Error creating reader: %@", readerError);
+            reader = nil;
+            return;
+        }
+        
+        AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+        if (!track) {
+            NSLog(@"[CameraVideoReplacer] No video track found");
+            reader = nil;
+            return;
+        }
+        
+        NSDictionary *settings = @{ (NSString *)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
+        output = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
+        
+        if ([reader canAddOutput:output]) {
+            [reader addOutput:output];
+            if ([reader startReading]) {
+                NSLog(@"[CameraVideoReplacer] Reader started");
+                isSetup = YES;
+            } else {
+                NSLog(@"[CameraVideoReplacer] Reader failed to start: %@", reader.error);
+                reader = nil;
+                output = nil;
+            }
+        } else {
+            NSLog(@"[CameraVideoReplacer] Cannot add output to reader");
+            reader = nil;
+            output = nil;
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[CameraVideoReplacer] Exception setting up reader: %@", exception);
+        reader = nil;
+        output = nil;
+        isSetup = NO;
+    }
+}
+
++ (void)resetReader {
+    if (reader) {
+        [reader cancelReading];
+    }
+    reader = nil;
+    output = nil;
+    isSetup = NO;
+    [self setupReader];
+}
+
++ (CMSampleBufferRef)getNextFrameBuffer {
+    @try {
+        // 如果还没有初始化，延迟初始化
+        if (!isSetup) {
+            NSLog(@"[CameraVideoReplacer] Reader not set up, initializing now...");
+            [self setupReader];
+            if (!isSetup) {
+                NSLog(@"[CameraVideoReplacer] Failed to initialize reader");
+                return nil;
+            }
+        }
+        
+        // 检查并重置读取器
+        if (!reader || reader.status != AVAssetReaderStatusReading) {
+            NSLog(@"[CameraVideoReplacer] Reader needs reset (status: %ld)...", (long)reader.status);
+            [self resetReader];
+            if (!isSetup) {
+                NSLog(@"[CameraVideoReplacer] Failed to reset reader");
+                return nil;
+            }
+        }
+        
+        // 安全检查
+        if (!output) {
+            NSLog(@"[CameraVideoReplacer] No output available");
+            return nil;
+        }
+        
+        // 尝试获取帧
+        CMSampleBufferRef buffer = [output copyNextSampleBuffer];
+        if (!buffer) {
+            NSLog(@"[CameraVideoReplacer] Frame empty, resetting reader...");
+            [self resetReader];
+            // 尝试再次获取帧
+            buffer = [output copyNextSampleBuffer];
+            if (!buffer) {
+                NSLog(@"[CameraVideoReplacer] Still no frame after reset");
+                return nil;
+            }
+        }
+        return buffer;
+    } @catch (NSException *exception) {
+        NSLog(@"[CameraVideoReplacer] Exception in getNextFrameBuffer: %@", exception);
+        return nil;
+    }
+}
+
+@end
+
+// ============================
+// 为了处理AVCapturePhotoCaptureDelegate回调
+// ============================
+
+@interface PhotoDelegateProxy : NSObject <AVCapturePhotoCaptureDelegate>
+@property (nonatomic, weak) id<AVCapturePhotoCaptureDelegate> originalDelegate;
+@end
+
+@implementation PhotoDelegateProxy
+
+// 拦截并处理相片捕获完成的回调
+- (void)captureOutput:(AVCapturePhotoOutput *)output didFinishProcessingPhoto:(AVCapturePhoto *)photo error:(NSError *)error {
+    // 调用原始委托以保持UI流程，但不会产生真实的照片
+    if ([self.originalDelegate respondsToSelector:@selector(captureOutput:didFinishProcessingPhoto:error:)]) {
+        [self.originalDelegate captureOutput:output didFinishProcessingPhoto:photo error:error];
+    }
+}
+
+// 转发其他所有消息到原始委托
+- (id)forwardingTargetForSelector:(SEL)aSelector {
+    if ([self.originalDelegate respondsToSelector:aSelector]) {
+        return self.originalDelegate;
+    }
+    return [super forwardingTargetForSelector:aSelector];
+}
+
+- (BOOL)respondsToSelector:(SEL)aSelector {
+    return [super respondsToSelector:aSelector] || [self.originalDelegate respondsToSelector:aSelector];
+}
+
+@end
+
+// ============================
+// 工具函数
+// ============================
+
+// 查找预览视图
+UIView *findPreviewView(UIView *view) {
+    if ([NSStringFromClass([view class]) containsString:@"CAMPreviewView"]) {
+        return view;
+    }
+    for (UIView *sub in view.subviews) {
+        UIView *result = findPreviewView(sub);
+        if (result) return result;
+    }
+    return nil;
+}
+
+// 从播放器获取当前帧
+UIImage* currentFrameFromPlayer() {
+    // 安全检查
+    if (!sharedPlayer || !sharedPlayer.currentItem || !sharedPlayer.currentItem.asset) {
+        NSLog(@"[CameraVideoTweak] Player not properly initialized for frame capture");
+        return nil;
+    }
+    
+    AVAssetImageGenerator *gen = [[AVAssetImageGenerator alloc] initWithAsset:sharedPlayer.currentItem.asset];
+    gen.appliesPreferredTrackTransform = YES;
+    gen.requestedTimeToleranceBefore = kCMTimeZero;
+    gen.requestedTimeToleranceAfter = kCMTimeZero;
+    
+    // 获取当前播放时间，如果无效就使用零时间
+    CMTime time = sharedPlayer.currentTime;
+    if (CMTIME_IS_INVALID(time)) {
+        NSLog(@"[CameraVideoTweak] Invalid time, using zero time");
+        time = kCMTimeZero;
+    }
+    
+    NSError *error = nil;
+    CGImageRef imageRef = [gen copyCGImageAtTime:time actualTime:NULL error:&error];
+    
+    if (error) {
+        NSLog(@"[CameraVideoTweak] Error generating frame: %@", error);
+        return nil;
+    }
+    
+    if (imageRef) {
+        UIImage *frameImage = [UIImage imageWithCGImage:imageRef];
+        CGImageRelease(imageRef);
+        NSLog(@"[CameraVideoTweak] Successfully generated frame: %fx%f", 
+              frameImage.size.width, frameImage.size.height);
+        return frameImage;
+    }
+    
+    NSLog(@"[CameraVideoTweak] Failed to get image reference");
+    return nil;
+}
+
+// ============================
+// Hook 部分 - 浏览器摄像头相关
+// ============================
+
+%hook AVCaptureVideoDataOutput
+
+- (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
+    // 获取当前应用标识
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier]; 
+    NSLog(@"[CameraVideoReplacer] Hooked setSampleBufferDelegate: %@ in app: %@", delegate, bundleID);
+    
+    // 检查是否是iOS相机应用
+    BOOL isCamera = [bundleID isEqualToString:@"com.apple.camera"];
+    
+    // 如果是相机应用，直接使用原始方法
+    if (isCamera) {
+        %orig(delegate, queue);
+        return;
+    }
+    
+    // 对于非相机应用（包括Safari和第三方浏览器），使用替换逻辑
+    %orig(delegate, queue);
+    
+    if (!delegate || didHookDelegate) return;  // 防止 null 或重复 hook
+    didHookDelegate = YES;
+    
+    Class delegateClass = object_getClass(delegate);
+    SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+    Method origMethod = class_getInstanceMethod(delegateClass, sel);
+    
+    if (!origMethod) {
+        NSLog(@"[CameraVideoReplacer] ERROR: Delegate method not found");
+        return;
+    }
+    
+    IMP origIMP = method_getImplementation(origMethod);
+    
+    IMP newIMP = imp_implementationWithBlock(^void(id _self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
+        @try {
+            // 获取虚拟帧
+            CMSampleBufferRef virtualFrame = [VirtualCameraReplacer getNextFrameBuffer];
+            if (virtualFrame) {
+                NSLog(@"[CameraVideoReplacer] Injected virtual frame in app: %@", bundleID);
+                ((void(*)(id, SEL, AVCaptureOutput*, CMSampleBufferRef, AVCaptureConnection*))origIMP)(_self, sel, output, virtualFrame, connection);
+                CFRelease(virtualFrame);
+            } else {
+                NSLog(@"[CameraVideoReplacer] No virtual frame available, using original");
+                ((void(*)(id, SEL, AVCaptureOutput*, CMSampleBufferRef, AVCaptureConnection*))origIMP)(_self, sel, output, sampleBuffer, connection);
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[CameraVideoReplacer] ERROR in injected method: %@", e);
+            ((void(*)(id, SEL, AVCaptureOutput*, CMSampleBufferRef, AVCaptureConnection*))origIMP)(_self, sel, output, sampleBuffer, connection);
+        }
+    });
+    
+    method_setImplementation(origMethod, newIMP);
+    NSLog(@"[CameraVideoReplacer] Successfully hooked delegate method");
+}
+
+%end
+
+%hook AVCaptureSession
+
+- (void)startRunning {
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+    NSLog(@"[CameraVideoReplacer] AVCaptureSession startRunning in app: %@", bundleID);
+    
+    // 检查是否是iOS相机应用
+    BOOL isCamera = [bundleID isEqualToString:@"com.apple.camera"];
+    
+    // 如果不是相机应用，则初始化视频阅读器
+    if (!isCamera) {
+        // 确保视频阅读器已经设置
+        [VirtualCameraReplacer setupReader];
+        NSLog(@"[CameraVideoReplacer] Video reader setup for browser");
+    }
+    
+    for (AVCaptureOutput *output in self.outputs) {
+        NSLog(@"[CameraVideoReplacer] Output: %@", NSStringFromClass([output class]));
+    }
+    
+    %orig();
+}
+
+%end
+
+// ============================
+// Hook 部分 - 原生相机相关
+// ============================
+
+// 预览层替换
+%hook UIViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    NSString *cls = NSStringFromClass([self class]);
+    if ([cls isEqualToString:@"CAMViewfinderViewController"]) {
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            NSLog(@"[CameraVideoTweak] Inject Preview into %@", cls);
+            UIView *previewView = findPreviewView(self.view);
+            if (previewView && ![previewView viewWithTag:9999]) {
+                // 确保视频文件已准备好
+                NSURL *videoURL = [NSURL fileURLWithPath:videoPath];
+                
+                NSLog(@"[CameraVideoTweak] Creating player with video at: %@", videoPath);
+                sharedPlayer = [AVPlayer playerWithURL:videoURL];
+                
+                [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemDidPlayToEndTimeNotification 
+                                                                  object:sharedPlayer.currentItem 
+                                                                   queue:[NSOperationQueue mainQueue] 
+                                                              usingBlock:^(NSNotification * _Nonnull note) {
+                    [sharedPlayer seekToTime:kCMTimeZero];
+                    [sharedPlayer play];
+                }];
+                
+                UIView *overlay = [[UIView alloc] initWithFrame:previewView.bounds];
+                overlay.tag = 9999;
+                overlay.userInteractionEnabled = NO;
+                overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+                
+                AVPlayerLayer *playerLayer = [AVPlayerLayer playerLayerWithPlayer:sharedPlayer];
+                playerLayer.frame = overlay.bounds;
+                playerLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
+                [overlay.layer addSublayer:playerLayer];
+                [previewView addSubview:overlay];
+                [sharedPlayer play];
+                
+                NSLog(@"[CameraVideoTweak] Player started");
+            }
+        });
+    }
+}
+%end
+
+// 拦截 AVCapturePhotoOutput
+%hook AVCapturePhotoOutput
+- (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
+    NSLog(@"[CameraVideoTweak] Intercept capturePhotoWithSettings!");
+    
+    // 获取当前视频帧
+    UIImage *fakeImage = currentFrameFromPlayer();
+    if (fakeImage) {
+        NSLog(@"[CameraVideoTweak] Got frame from video player, size: %fx%f", fakeImage.size.width, fakeImage.size.height);
+        
+        // 保存到相册
+        [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
+            if (status == PHAuthorizationStatusAuthorized) {
+                [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
+                    [PHAssetChangeRequest creationRequestForAssetFromImage:fakeImage];
+                } completionHandler:^(BOOL success, NSError * _Nullable error) {
+                    NSLog(@"[CameraVideoTweak] Saved fake frame to album: %d, error: %@", success, error);
+                }];
+            } else {
+                NSLog(@"[CameraVideoTweak] No photo library permission");
+            }
+        }];
+    } else {
+        NSLog(@"[CameraVideoTweak] Failed to get frame from video player");
+    }
+    
+    // 使用我们的代理包装原始代理，以控制保存过程
+    PhotoDelegateProxy *proxyDelegate = [[PhotoDelegateProxy alloc] init];
+    proxyDelegate.originalDelegate = delegate;
+    
+    // 调用原始方法但使用我们的代理
+    %orig(settings, proxyDelegate);
+}
+%end
+
+// 阻止系统 PreviewLayer
+%hook CALayer
+- (void)addSublayer:(CALayer *)layer {
+    if ([layer isKindOfClass:NSClassFromString(@"AVCaptureVideoPreviewLayer")]) {
+        NSLog(@"[CameraVideoTweak] blocked system AVCaptureVideoPreviewLayer!");
+        return;
+    }
+    %orig;
+}
+%end
+
+// ============================
+// 初始化部分
+// ============================
+
+%ctor {
+    @autoreleasepool {
+        NSLog(@"[CameraVideoTweak] Loaded unified camera tweak for all browsers and camera!");
+        
+        // 获取当前应用的标识符
+        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+        NSLog(@"[CameraVideoTweak] Running in application: %@", bundleID);
+        
+        // 准备视频文件路径
+        prepareVideoFile();
+        
+        // 判断是否是相机应用
+        BOOL isCamera = [bundleID isEqualToString:@"com.apple.camera"];
+        
+        if (isCamera) {
+            NSLog(@"[CameraVideoTweak] Running in Camera app - initializing AVPlayer preview");
+            // 对于相机应用，可以预初始化视频播放器，但延迟 reader 初始化
+        } else {
+            NSLog(@"[CameraVideoTweak] Running in browser or other app - initializing video hooks");
+            // 对于所有非相机应用，默认初始化视频替换逻辑
+            didHookDelegate = NO; // 重置标记，确保可以 hook
+        }
+    }
+}

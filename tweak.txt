@@ -1,0 +1,1681 @@
+#import <UIKit/UIKit.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreImage/CoreImage.h>
+#import <objc/runtime.h>
+#import <Photos/Photos.h>
+#import <CoreLocation/CoreLocation.h>
+#import <sys/utsname.h>
+#import <CoreMedia/CMSampleBuffer.h>
+#import <ImageIO/ImageIO.h>
+#import <mach/mach_time.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <CoreMedia/CMSampleBuffer.h>
+
+
+// 如果需要，定义这些常量
+#ifndef kCGImagePropertyExifMake
+#define kCGImagePropertyExifMake CFSTR("Make")
+#endif
+
+#ifndef kCGImagePropertyExifModel
+#define kCGImagePropertyExifModel CFSTR("Model")
+#endif
+
+#ifndef kCGImagePropertyExifSoftware
+#define kCGImagePropertyExifSoftware CFSTR("Software")
+#endif
+// iOS 14+使用UniformTypeIdentifiers框架
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 140000
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#else
+// 旧版iOS使用MobileCoreServices
+#import <MobileCoreServices/MobileCoreServices.h>
+#endif
+static NSString * const MyAVURLAssetHTTPHeaderFieldsKey = @"AVURLAssetHTTPHeaderFieldsKey";
+// 自定义的创建带附件的SampleBuffer的函数
+static OSStatus MyCreateSampleBufferWithAttachments(
+    CMSampleBufferRef sourceBuf,
+    CFDictionaryRef attachments,
+    CMSampleBufferRef *outBuf)
+{
+    // 获取源缓冲区信息
+    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sourceBuf);
+    CMTime presentationTime = CMSampleBufferGetPresentationTimeStamp(sourceBuf);
+    CMTime duration = CMSampleBufferGetDuration(sourceBuf);
+    CMTime decodeTime = CMSampleBufferGetDecodeTimeStamp(sourceBuf);
+    
+    // 创建格式描述
+    CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sourceBuf);
+    //CMItemCount numSamples = CMSampleBufferGetNumSamples(sourceBuf);
+    
+    // 创建定时信息
+    CMSampleTimingInfo timing;
+    timing.duration = duration;
+    timing.presentationTimeStamp = presentationTime;
+    timing.decodeTimeStamp = decodeTime;
+    
+    // 创建新的SampleBuffer
+    OSStatus status;
+    if (imageBuffer) {
+        // 如果有图像缓冲区，使用它创建
+        status = CMSampleBufferCreateForImageBuffer(
+            kCFAllocatorDefault,
+            imageBuffer,
+            true,
+            NULL,
+            NULL,
+            formatDesc,
+            &timing,
+            outBuf);
+    } else {
+        // 否则复制原始样本数据
+        //CMBlockBufferRef dataBuffer = CMSampleBufferGetDataBuffer(sourceBuf);
+        status = CMSampleBufferCreateCopy(kCFAllocatorDefault, sourceBuf, outBuf);
+    }
+    
+    // 如果创建成功且有附件，添加附件
+    if (status == noErr && *outBuf && attachments) {
+        CMSetAttachments(*outBuf, attachments, kCMAttachmentMode_ShouldPropagate);
+    }
+    
+    return status;
+}
+
+// MARK: - 全局配置
+#define DEBUG_LOG 1    // 调试日志开关
+#define BUFFER_CACHE_SIZE 5 // 帧缓存大小，平滑播放
+
+// 全局状态
+static BOOL virtualCameraEnabled = NO;
+static int rotationAngle = 0;
+static NSInteger currentDataSource = 0; // 0=原生 1=本地 2=RTMP
+static NSDictionary *globalEXIFData = nil;
+static BOOL useRealEXIF = NO;
+static dispatch_queue_t videoProcessingQueue;
+static CMSampleBufferRef cachedBuffers[BUFFER_CACHE_SIZE]; // 帧缓存数组
+static int currentBufferIndex = 0;
+static CFMutableDictionaryRef cameraProperties = NULL; // 摄像头属性缓存
+
+// 本地视频播放器
+static AVAsset *localVideoAsset = nil;
+static AVAssetReader *assetReader = nil;
+static AVAssetReaderTrackOutput *assetReaderOutput = nil;
+//static CMTime localVideoCurrentTime = kCMTimeZero;
+static dispatch_source_t localVideoTimer = NULL;
+
+// RTMP 流播放器
+static AVPlayer *rtmpPlayer = nil;
+static AVPlayerItemVideoOutput *rtmpOutput = nil;
+static BOOL rtmpReady = NO;
+static NSString *lastRTMPURL = nil;
+static dispatch_source_t rtmpMonitorTimer = NULL;
+
+// WebRTC 帧率跟踪
+static uint32_t originalFrameRate = 0;
+static uint64_t lastFrameTimestamp = 0;
+static uint64_t frameIntervalNanos = 0;
+static double averageFrameInterval = 0.0;
+static NSInteger frameCounter = 0;
+static const NSInteger FRAME_STAT_WINDOW = 30; // 统计30帧计算平均帧率
+
+// RTMP 流状态
+typedef struct {
+    BOOL isConnected;
+    BOOL isBuffering;
+    NSInteger bufferEmptyCount;
+    NSInteger bufferFullCount;
+    NSTimeInterval lastBufferingTime;
+    NSTimeInterval reconnectDelay;
+    NSInteger reconnectAttempts;
+} VCRTMPStreamState;
+
+static VCRTMPStreamState rtmpState;
+
+// MARK: - 前向声明
+@class VCFloatingButton;
+static void vc_stop_virtual_camera(void);
+static void vc_select_video_from_album(void);
+static void vc_extract_real_exif(void);
+static void vc_prompt_for_rtmp_url(void);
+static void vc_show_menu_controller(void);
+static void vc_setup_local_video(NSURL *videoURL);
+static void vc_start_rtmp_stream(NSString *urlString);
+static void vc_reconnect_rtmp_stream(void);
+static void vc_start_rtmp_monitor(void);
+static void vc_initialize_rtmp_state(void);
+static void vc_initialize_frame_tracking(void);
+static void vc_adjust_rtmp_buffer_size(AVPlayerItem *item);
+static CMSampleBufferRef vc_process_frame(CMSampleBufferRef buffer);
+static CMSampleBufferRef vc_read_next_video_frame(void);
+static CMSampleBufferRef vc_get_rtmp_frame(void);
+static CMSampleBufferRef vc_inject_exif(CMSampleBufferRef buffer);
+static CMSampleBufferRef vc_synchronize_frame_timestamp(CMSampleBufferRef buffer);
+static CMSampleBufferRef vc_process_webrtc_frame(CMSampleBufferRef buffer);
+static NSDictionary* vc_get_device_real_exif(void);
+static void vc_update_frame_stats(CMSampleBufferRef buffer);
+
+// MARK: - iOS 15 安全适配
+@interface UIWindow (VirtualCamSafe)
++ (UIWindow *)vc_keyWindow;
+@end
+
+@implementation UIWindow (VirtualCamSafe)
++ (UIWindow *)vc_keyWindow {
+    if (@available(iOS 15.0, *)) {
+        // iOS 15推荐使用Scene API
+        for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *window in scene.windows) {
+                    if (window.isKeyWindow) {
+                        return window;
+                    }
+                }
+                // 如果没有找到keyWindow，返回第一个窗口
+                if (scene.windows.count > 0) {
+                    return scene.windows.firstObject;
+                }
+            }
+        }
+    } 
+    
+    return nil;
+}
+@end
+
+// MARK: - WebRTC Hook 接口
+@interface RTCCameraVideoCapturer : NSObject
+- (void)captureOutput:(AVCaptureOutput *)captureOutput
+didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+       fromConnection:(AVCaptureConnection *)connection;
+@end
+
+// MARK: - 图片选择器代理
+@interface VCImagePickerDelegate : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+@property (nonatomic, copy) void (^completionHandler)(NSURL *fileURL);
+@end
+
+@implementation VCImagePickerDelegate
+
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
+    NSURL *fileURL = nil;
+    
+    // 针对不同类型的媒体获取URL
+    if ([info objectForKey:UIImagePickerControllerMediaURL]) {
+        fileURL = info[UIImagePickerControllerMediaURL];
+    } else if ([info objectForKey:UIImagePickerControllerImageURL]) {
+        fileURL = info[UIImagePickerControllerImageURL];
+    } else if ([info objectForKey:UIImagePickerControllerPHAsset]) {
+        // 处理PHAsset的情况
+        PHAsset *asset = info[UIImagePickerControllerPHAsset];
+        if (asset.mediaType == PHAssetMediaTypeVideo) {
+            [[PHImageManager defaultManager] requestAVAssetForVideo:asset options:nil resultHandler:^(AVAsset * _Nullable asset, AVAudioMix * _Nullable audioMix, NSDictionary * _Nullable info) {
+                if ([asset isKindOfClass:[AVURLAsset class]]) {
+                    NSURL *url = ((AVURLAsset *)asset).URL;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if (self.completionHandler) {
+                            self.completionHandler(url);
+                        }
+                    });
+                }
+            }];
+        }
+    }
+    
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    
+    if (fileURL && self.completionHandler) {
+        self.completionHandler(fileURL);
+    }
+}
+
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    
+    if (self.completionHandler) {
+        self.completionHandler(nil);
+    }
+}
+
+@end
+
+// MARK: - 相机代理
+@interface VCCameraDelegate : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
+@property (nonatomic, copy) void (^didCaptureBuffer)(CMSampleBufferRef sampleBuffer);
+@end
+
+@implementation VCCameraDelegate
+- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
+    if (self.didCaptureBuffer) {
+        self.didCaptureBuffer(sampleBuffer);
+    }
+}
+@end
+
+// MARK: - 悬浮球控件
+@interface VCFloatingButton : UIButton
+@property (nonatomic, strong) UILabel *statusLabel;
+@end
+
+@implementation VCFloatingButton
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.7];
+        self.layer.cornerRadius = frame.size.width/2;
+        [self setTitle:@"↻" forState:UIControlStateNormal];
+        self.titleLabel.font = [UIFont boldSystemFontOfSize:24];
+        self.tag = 9999;
+        
+        // 状态标签
+        self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, -30, 100, 25)];
+        self.statusLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.6];
+        self.statusLabel.textColor = [UIColor whiteColor];
+        self.statusLabel.textAlignment = NSTextAlignmentCenter;
+        self.statusLabel.font = [UIFont systemFontOfSize:12];
+        self.statusLabel.layer.cornerRadius = 12;
+        self.statusLabel.clipsToBounds = YES;
+        self.statusLabel.text = @"原生摄像头";
+        [self addSubview:self.statusLabel];
+        
+        // 拖动手势
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] 
+            initWithTarget:self action:@selector(handlePan:)];
+        [self addGestureRecognizer:pan];
+        
+        // 点击旋转
+        [self addTarget:self action:@selector(rotateAction) 
+            forControlEvents:UIControlEventTouchUpInside];
+            
+        // 长按显示菜单
+        UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc]
+            initWithTarget:self action:@selector(showMenu:)];
+        longPress.minimumPressDuration = 0.8;
+        [self addGestureRecognizer:longPress];
+    }
+    return self;
+}
+
+- (void)showMenu:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        [self showActionMenu];
+    }
+}
+
+- (void)showActionMenu {
+    // 显示操作菜单
+    vc_show_menu_controller();
+}
+
+- (void)rotateAction {
+    rotationAngle = (rotationAngle + 90) % 360;
+    #if DEBUG_LOG
+    NSLog(@"[VirtualCam] 旋转角度: %d°", rotationAngle);
+    #endif
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)gesture {
+    UIWindow *window = [UIWindow vc_keyWindow];
+    CGPoint translation = [gesture translationInView:window];
+    
+    // 安全区域计算
+    UIEdgeInsets safeArea = window.safeAreaInsets;
+    CGRect newFrame = self.frame;
+    newFrame.origin.x += translation.x;
+    newFrame.origin.y += translation.y;
+    
+    // 边界限制
+    newFrame.origin.x = MAX(safeArea.left, MIN(newFrame.origin.x, 
+        window.bounds.size.width - safeArea.right - newFrame.size.width));
+    newFrame.origin.y = MAX(safeArea.top + 20, MIN(newFrame.origin.y, 
+        window.bounds.size.height - safeArea.bottom - newFrame.size.height));
+    
+    self.frame = newFrame;
+    [gesture setTranslation:CGPointZero inView:window];
+}
+
+- (void)updateSourceLabel {
+    switch (currentDataSource) {
+        case 0:
+            self.statusLabel.text = @"原生摄像头";
+            break;
+        case 1:
+            self.statusLabel.text = @"本地视频";
+            break;
+        case 2:
+            self.statusLabel.text = @"RTMP流";
+            break;
+    }
+}
+
+@end
+
+// MARK: - 操作菜单显示
+static void vc_show_menu_controller() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *alert = [UIAlertController 
+            alertControllerWithTitle:@"虚拟摄像头"
+            message:@"选择操作"
+            preferredStyle:UIAlertControllerStyleActionSheet];
+        
+        // 从相册选择视频
+        [alert addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" 
+            style:UIAlertActionStyleDefault 
+            handler:^(UIAlertAction *action) {
+                vc_select_video_from_album();
+            }]];
+        
+        // 获取EXIF数据
+        [alert addAction:[UIAlertAction actionWithTitle:useRealEXIF ? @"关闭EXIF数据" : @"启用设备EXIF数据" 
+            style:UIAlertActionStyleDefault 
+            handler:^(UIAlertAction *action) {
+                vc_extract_real_exif();
+            }]];
+        
+        // 输入RTMP流
+        [alert addAction:[UIAlertAction actionWithTitle:@"从RTMP获取视频" 
+            style:UIAlertActionStyleDefault 
+            handler:^(UIAlertAction *action) {
+                vc_prompt_for_rtmp_url();
+            }]];
+        
+        // 启动虚拟相机
+        [alert addAction:[UIAlertAction actionWithTitle:virtualCameraEnabled ? @"重启虚拟相机" : @"启动虚拟相机" 
+            style:UIAlertActionStyleDefault 
+            handler:^(UIAlertAction *action) {
+                virtualCameraEnabled = YES;
+                
+                // 查找悬浮按钮，如果不存在则创建
+                UIView *existingBtn = [[UIWindow vc_keyWindow] viewWithTag:9999];
+                if (!existingBtn) {
+                    VCFloatingButton *btn = [[VCFloatingButton alloc] initWithFrame:CGRectMake(30, 100, 60, 60)];
+                    [[UIWindow vc_keyWindow] addSubview:btn];
+                    [btn updateSourceLabel];
+                }
+            }]];
+        
+        // 关闭虚拟相机
+        [alert addAction:[UIAlertAction actionWithTitle:@"关闭虚拟相机" 
+            style:UIAlertActionStyleDestructive 
+            handler:^(UIAlertAction *action) {
+                vc_stop_virtual_camera();
+            }]];
+        
+        // 取消
+        [alert addAction:[UIAlertAction actionWithTitle:@"取消" 
+            style:UIAlertActionStyleCancel 
+            handler:nil]];
+        
+        [[UIWindow vc_keyWindow].rootViewController presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+// MARK: - 停止虚拟摄像头
+static void vc_stop_virtual_camera() {
+    virtualCameraEnabled = NO;
+    currentDataSource = 0;
+    
+    // 停止RTMP播放器
+    if (rtmpPlayer) {
+        [rtmpPlayer pause];
+        rtmpPlayer = nil;
+        rtmpOutput = nil;
+        rtmpReady = NO;
+    }
+    
+    // 停止RTMP监控
+    if (rtmpMonitorTimer) {
+        dispatch_source_cancel(rtmpMonitorTimer);
+        rtmpMonitorTimer = NULL;
+    }
+    
+    // 停止本地视频定时器
+    if (localVideoTimer) {
+        dispatch_source_cancel(localVideoTimer);
+        localVideoTimer = NULL;
+    }
+    
+    // 清理本地视频资源
+    assetReader = nil;
+    assetReaderOutput = nil;
+    localVideoAsset = nil;
+    
+    // 清理缓存帧
+    for (int i = 0; i < BUFFER_CACHE_SIZE; i++) {
+        if (cachedBuffers[i]) {
+            CFRelease(cachedBuffers[i]);
+            cachedBuffers[i] = NULL;
+        }
+    }
+    
+    // 移除悬浮按钮
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[[UIWindow vc_keyWindow] viewWithTag:9999] removeFromSuperview];
+    });
+    
+    #if DEBUG_LOG
+    NSLog(@"[VirtualCam] 已停止虚拟摄像头");
+    #endif
+}
+
+// MARK: - 从相册选择视频
+static void vc_select_video_from_album() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatus];
+        if (status == PHAuthorizationStatusNotDetermined) {
+            [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus newStatus) {
+                if (newStatus == PHAuthorizationStatusAuthorized) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        vc_select_video_from_album();
+                    });
+                }
+            }];
+            return;
+        } else if (status != PHAuthorizationStatusAuthorized) {
+            UIAlertController *alert = [UIAlertController 
+                alertControllerWithTitle:@"访问照片库" 
+                message:@"需要访问照片库权限来选择视频" 
+                preferredStyle:UIAlertControllerStyleAlert];
+                
+            [alert addAction:[UIAlertAction actionWithTitle:@"确定" 
+                style:UIAlertActionStyleDefault handler:nil]];
+                
+            [[UIWindow vc_keyWindow].rootViewController presentViewController:alert animated:YES completion:nil];
+            return;
+        }
+        
+        UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+        picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+        
+        // 不同iOS版本适配媒体类型常量
+        if (@available(iOS 14.0, *)) {
+            picker.mediaTypes = @[(NSString *)UTTypeMovie.identifier];
+        } else {
+            picker.mediaTypes = @[(NSString *)UTTypeMovie.identifier];
+
+        }
+        
+        picker.allowsEditing = NO;
+        
+        VCImagePickerDelegate *delegate = [[VCImagePickerDelegate alloc] init];
+        delegate.completionHandler = ^(NSURL *videoURL) {
+            if (videoURL) {
+                vc_setup_local_video(videoURL);
+                
+                // 更新数据源
+                currentDataSource = 1;
+                VCFloatingButton *btn = (VCFloatingButton *)[[UIWindow vc_keyWindow] viewWithTag:9999];
+                if (btn) [btn updateSourceLabel];
+            }
+        };
+        
+        // 保存代理防止被释放
+        objc_setAssociatedObject(picker, "VCPickerDelegate", delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        
+        picker.delegate = delegate;
+        [[UIWindow vc_keyWindow].rootViewController presentViewController:picker animated:YES completion:nil];
+    });
+}
+
+// MARK: - 设置本地视频
+static void vc_setup_local_video(NSURL *videoURL) {
+
+
+    @try {
+        #if DEBUG_LOG
+        NSLog(@"[VirtualCam] 设置本地视频: %@", videoURL.absoluteString);
+        #endif
+        
+        // 原有代码...
+    // 清理旧资源
+    if (localVideoTimer) {
+	NSLog(@"[VirtualCam] 清理旧的视频定时器");
+        dispatch_source_cancel(localVideoTimer);
+        localVideoTimer = NULL;
+    }
+    
+    // 创建Asset
+    localVideoAsset = [AVAsset assetWithURL:videoURL];
+    
+    // 设置视频读取器
+    NSError *error = nil;
+    assetReader = [AVAssetReader assetReaderWithAsset:localVideoAsset error:&error];
+    if (error) {
+        #if DEBUG_LOG
+        NSLog(@"[VirtualCam] 创建AssetReader失败: %@", error);
+        #endif
+        return;
+    }
+    
+    // 配置视频轨道输出
+    NSLog(@"[VirtualCam] 配置视频轨道");
+    AVAssetTrack *videoTrack = [[localVideoAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    if (!videoTrack) {
+        NSLog(@"[VirtualCam] 错误: 未找到视频轨道");
+        return;
+    }
+    NSDictionary *outputSettings = @{
+        (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)
+    };
+    
+    assetReaderOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:videoTrack 
+                                                                   outputSettings:outputSettings];
+    if (!assetReaderOutput) {
+        NSLog(@"[VirtualCam] 创建AssetReaderTrackOutput失败");
+        return;
+    }
+    [assetReader addOutput:assetReaderOutput];
+    BOOL startSuccess = [assetReader startReading];
+    if (!startSuccess) {
+        NSLog(@"[VirtualCam] 启动视频读取失败: %@", assetReader.error);
+        return;
+    }
+    
+    // 创建读取定时器(以视频原始帧率播放)
+    // CMTimeScale timeScale = videoTrack.naturalTimeScale;
+    Float64 frameRate = videoTrack.nominalFrameRate;
+    if (frameRate <= 0) frameRate = 30; // 默认30FPS
+    
+    // 记录原始帧率，用于同步
+    originalFrameRate = (uint32_t)frameRate;
+    
+    uint64_t intervalNanoseconds = (uint64_t)(NSEC_PER_SEC / frameRate);
+    localVideoTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, videoProcessingQueue);
+    if (!localVideoTimer) {
+    NSLog(@"[VirtualCam] 错误: 无法创建定时器");
+    return;
+    }
+
+    dispatch_source_set_timer(localVideoTimer, dispatch_time(DISPATCH_TIME_NOW, 0), 
+                            intervalNanoseconds, 0);
+    
+    __block CMTime currentTimestamp = kCMTimeZero;
+    
+    dispatch_source_set_event_handler(localVideoTimer, ^{
+        CMSampleBufferRef sampleBuffer = vc_read_next_video_frame();
+        if (currentBufferIndex >= 0 && currentBufferIndex < BUFFER_CACHE_SIZE) {
+            // 缓存帧
+            if (cachedBuffers[currentBufferIndex]) {
+                CFRelease(cachedBuffers[currentBufferIndex]);
+            }
+            cachedBuffers[currentBufferIndex] = sampleBuffer;
+            currentBufferIndex = (currentBufferIndex + 1) % BUFFER_CACHE_SIZE;
+            
+            // 更新时间戳
+            currentTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        } else {
+            NSLog(@"[VirtualCam] 错误: 缓冲区索引无效: %d", currentBufferIndex);
+            [assetReader cancelReading];
+            assetReader = [AVAssetReader assetReaderWithAsset:localVideoAsset error:nil];
+            [assetReader addOutput:assetReaderOutput];
+            [assetReader startReading];
+            //currentTimestamp = kCMTimeZero;
+        }
+    });
+    
+    dispatch_resume(localVideoTimer);
+    
+    #if DEBUG_LOG
+    NSLog(@"[VirtualCam] 本地视频设置完成, 帧率: %.2f", frameRate);
+    #endif
+    } @catch (NSException *exception) {
+        NSLog(@"[VirtualCam] 设置视频异常: %@", exception);
+    }
+	
+
+    
+}
+
+// MARK: - 读取下一帧视频
+static CMSampleBufferRef vc_read_next_video_frame() {
+    if (assetReader.status != AVAssetReaderStatusReading) return NULL;
+    
+    CMSampleBufferRef sampleBuffer = NULL;
+    //CMTime frameTime = kCMTimeZero;
+    
+    // 读取下一帧
+    CMSampleBufferRef nextBuffer = [assetReaderOutput copyNextSampleBuffer];
+    if (!nextBuffer) return NULL;
+    
+    // 创建带EXIF的SampleBuffer
+    if (useRealEXIF && globalEXIFData) {
+        sampleBuffer = vc_inject_exif(nextBuffer);
+        CFRelease(nextBuffer);
+    } else {
+        sampleBuffer = nextBuffer;
+    }
+    
+    return sampleBuffer;
+}
+
+// MARK: - 提示输入RTMP URL
+static void vc_prompt_for_rtmp_url() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *alert = [UIAlertController 
+            alertControllerWithTitle:@"输入RTMP流地址" 
+            message:@"支持RTMP、HLS (m3u8)等格式" 
+            preferredStyle:UIAlertControllerStyleAlert];
+        
+        [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+            textField.placeholder = @"rtmp://... 或 http://...m3u8";
+            textField.keyboardType = UIKeyboardTypeURL;
+            textField.clearButtonMode = UITextFieldViewModeWhileEditing;
+            
+            // 如果有上次使用的URL，则填入
+            if (lastRTMPURL) {
+                textField.text = lastRTMPURL;
+            }
+        }];
+        
+        [alert addAction:[UIAlertAction actionWithTitle:@"取消" 
+                                                  style:UIAlertActionStyleCancel 
+                                                handler:nil]];
+        
+        [alert addAction:[UIAlertAction actionWithTitle:@"开始播放" 
+                                                  style:UIAlertActionStyleDefault 
+                                                handler:^(UIAlertAction *action) {
+            NSString *urlString = alert.textFields.firstObject.text;
+            if (urlString.length > 0) {
+                vc_start_rtmp_stream(urlString);
+                
+                // 更新数据源
+                currentDataSource = 2;
+                VCFloatingButton *btn = (VCFloatingButton *)[[UIWindow vc_keyWindow] viewWithTag:9999];
+                if (btn) [btn updateSourceLabel];
+            }
+        }]];
+        
+        [[UIWindow vc_keyWindow].rootViewController presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+// MARK: - RTMP状态初始化
+static void vc_initialize_rtmp_state() {
+    rtmpState.isConnected = NO;
+    rtmpState.isBuffering = NO;
+    rtmpState.bufferEmptyCount = 0;
+    rtmpState.bufferFullCount = 0;
+    rtmpState.lastBufferingTime = 0;
+    rtmpState.reconnectDelay = 2.0; // 初始重连延迟2秒
+    rtmpState.reconnectAttempts = 0;
+}
+
+// MARK: - RTMP缓冲区调整
+static void vc_adjust_rtmp_buffer_size(AVPlayerItem *item) {
+    if (!item) return;
+    
+    // 获取当前缓冲状态
+    NSArray *loadedTimeRanges = item.loadedTimeRanges;
+    CMTimeRange timeRange = [[loadedTimeRanges firstObject] CMTimeRangeValue];
+    float bufferedDuration = CMTimeGetSeconds(timeRange.duration);
+    
+    // 获取网络状况
+    AVPlayerItemAccessLog *accessLog = [item accessLog];
+    AVPlayerItemAccessLogEvent *lastEvent = [accessLog.events lastObject];
+    
+    float currentBitrate = 0;
+    if (lastEvent) {
+        currentBitrate = lastEvent.observedBitrate; // bits per second
+    }
+    
+    // 基于网络状况调整缓冲区大小
+    if (@available(iOS 15.0, *)) {
+        if (currentBitrate > 0) {
+            // 网络良好时减小缓冲区，减少延迟
+            if (currentBitrate > 5000000) { // 5Mbps以上
+                item.configuredTimeOffsetFromLive = CMTimeMake(2, 1); // 2秒缓冲
+                rtmpState.isBuffering = NO;
+            }
+            // 网络一般时使用中等缓冲区
+            else if (currentBitrate > 2000000) { // 2Mbps以上
+                item.configuredTimeOffsetFromLive = CMTimeMake(3, 1); // 3秒缓冲
+                rtmpState.isBuffering = NO;
+            }
+            // 网络较差时增大缓冲区，提高稳定性
+            else {
+                item.configuredTimeOffsetFromLive = CMTimeMake(5, 1); // 5秒缓冲
+                rtmpState.isBuffering = YES;
+            }
+        }
+    } else {
+        if (currentBitrate > 0) {
+            // 网络良好时减小缓冲区，减少延迟
+            if (currentBitrate > 5000000) { // 5Mbps以上
+                item.preferredForwardBufferDuration = 2.0; // 2秒缓冲
+                rtmpState.isBuffering = NO;
+            }
+            // 网络一般时使用中等缓冲区
+            else if (currentBitrate > 2000000) { // 2Mbps以上
+                item.preferredForwardBufferDuration = 3.0; // 3秒缓冲
+                rtmpState.isBuffering = NO;
+            }
+            // 网络较差时增大缓冲区，提高稳定性
+            else {
+		                item.preferredForwardBufferDuration = 5.0; // 5秒缓冲
+                rtmpState.isBuffering = YES;
+            }
+        }
+    }
+    
+    // 监控缓冲区状态
+    if (bufferedDuration < 0.5) { // 缓冲区接近为空
+        rtmpState.bufferEmptyCount++;
+        rtmpState.bufferFullCount = 0;
+        rtmpState.isBuffering = YES;
+        
+        // 如果连续多次缓冲区接近为空，考虑重连
+        if (rtmpState.bufferEmptyCount > 5) {
+            vc_reconnect_rtmp_stream();
+        }
+    } else if (bufferedDuration > 1.0) { // 缓冲区有足够内容
+        rtmpState.bufferFullCount++;
+        rtmpState.bufferEmptyCount = 0;
+        
+        if (rtmpState.bufferFullCount > 3) {
+            rtmpState.isBuffering = NO;
+        }
+    }
+}
+
+// MARK: - RTMP流监控
+static void vc_start_rtmp_monitor() {
+    if (rtmpMonitorTimer) {
+        dispatch_source_cancel(rtmpMonitorTimer);
+        rtmpMonitorTimer = NULL;
+    }
+    
+    // 创建监控定时器
+    rtmpMonitorTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    dispatch_source_set_timer(rtmpMonitorTimer, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), 1 * NSEC_PER_SEC, 0.1 * NSEC_PER_SEC);
+    
+    dispatch_source_set_event_handler(rtmpMonitorTimer, ^{
+        if (rtmpPlayer && rtmpPlayer.currentItem) {
+            // 监控播放状态
+            if (rtmpPlayer.currentItem.status == AVPlayerItemStatusReadyToPlay) {
+                rtmpState.isConnected = YES;
+                vc_adjust_rtmp_buffer_size(rtmpPlayer.currentItem);
+            } else if (rtmpPlayer.currentItem.status == AVPlayerItemStatusFailed) {
+                rtmpState.isConnected = NO;
+                
+                #if DEBUG_LOG
+                NSLog(@"[VirtualCam] RTMP流播放失败: %@", rtmpPlayer.currentItem.error);
+                #endif
+                
+                // 尝试重连
+                vc_reconnect_rtmp_stream();
+            }
+            
+            // 检查播放器是否暂停
+            if (rtmpPlayer.timeControlStatus == AVPlayerTimeControlStatusPaused && rtmpState.isConnected) {
+                [rtmpPlayer play];
+            }
+        }
+    });
+    
+    dispatch_resume(rtmpMonitorTimer);
+}
+
+// MARK: - RTMP流重连
+static void vc_reconnect_rtmp_stream() {
+    if (!lastRTMPURL || rtmpState.reconnectAttempts > 10) return;
+    
+    // 指数退避重连策略
+    NSTimeInterval delay = rtmpState.reconnectDelay * (1 << MIN(rtmpState.reconnectAttempts, 5));
+    rtmpState.reconnectAttempts++;
+    
+    #if DEBUG_LOG
+    NSLog(@"[VirtualCam] 尝试重连RTMP流 (尝试次数: %ld, 延迟: %.2f秒)", (long)rtmpState.reconnectAttempts, delay);
+    #endif
+    
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // 检查重连条件
+        if (!rtmpState.isConnected && lastRTMPURL) {
+            vc_start_rtmp_stream(lastRTMPURL);
+        }
+    });
+}
+
+// MARK: - 启动RTMP流
+static void vc_start_rtmp_stream(NSString *urlString) {
+    NSURL *url = [NSURL URLWithString:urlString];
+    if (!url) return;
+    
+    #if DEBUG_LOG
+    NSLog(@"[VirtualCam] 启动RTMP流: %@", urlString);
+    #endif
+    
+    // 保存URL用于重连
+    lastRTMPURL = [urlString copy];
+    
+    // 初始化RTMP状态
+    vc_initialize_rtmp_state();
+    
+    // 清理旧资源
+    if (rtmpPlayer) {
+        [rtmpPlayer pause];
+        rtmpPlayer = nil;
+        rtmpOutput = nil;
+    }
+    
+    // 配置AVAsset选项
+    // 然后在代码中使用
+    NSDictionary *options = @{
+    MyAVURLAssetHTTPHeaderFieldsKey: @{
+        @"User-Agent": @"Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
+    }
+};
+    
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:options];
+    
+    // 预加载资源
+    [asset loadValuesAsynchronouslyForKeys:@[@"tracks"] completionHandler:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSError *error = nil;
+            AVKeyValueStatus status = [asset statusOfValueForKey:@"tracks" error:&error];
+            
+            if (status == AVKeyValueStatusLoaded) {
+                // 创建播放项
+                AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:asset];
+                
+                // 配置缓冲策略
+                if (@available(iOS 15.0, *)) {
+                    CMTimebaseRef timebase = item.timebase;
+                    if (timebase) {
+                        CMTimebaseSetRate(timebase, 1.0);
+                    }
+                    item.automaticallyPreservesTimeOffsetFromLive = YES;
+                    item.configuredTimeOffsetFromLive = CMTimeMake(3, 1); // 3秒缓冲
+                } else {
+                    item.preferredForwardBufferDuration = 3.0; // 3秒预缓冲
+                }
+                
+                // 视频输出设置
+                NSDictionary *pixAttr = @{
+                    (NSString*)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)
+                };
+                rtmpOutput = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:pixAttr];
+                [item addOutput:rtmpOutput];
+                
+                // 处理器类，实现KVO响应
+                static dispatch_once_t onceToken;
+                static Class observerClass;
+                dispatch_once(&onceToken, ^{
+                    observerClass = objc_allocateClassPair([NSObject class], "VCPlayerObserver", 0);
+                    
+                    class_addMethod(observerClass, @selector(observeValueForKeyPath:ofObject:change:context:), imp_implementationWithBlock(^(id self, NSString *keyPath, id object, NSDictionary *change, void *context) {
+                        if ([object isKindOfClass:[AVPlayerItem class]] && [keyPath isEqualToString:@"status"]) {
+                            AVPlayerItem *item = (AVPlayerItem *)object;
+                            if (item.status == AVPlayerItemStatusReadyToPlay) {
+                                rtmpReady = YES;
+                                rtmpState.isConnected = YES;
+                                rtmpState.reconnectAttempts = 0; // 重置重连计数
+                                
+                                #if DEBUG_LOG
+                                NSLog(@"[VirtualCam] RTMP流已就绪");
+                                #endif
+                            } else if (item.status == AVPlayerItemStatusFailed) {
+                                rtmpReady = NO;
+                                rtmpState.isConnected = NO;
+                                
+                                #if DEBUG_LOG
+                                NSLog(@"[VirtualCam] RTMP流加载失败: %@", item.error);
+                                #endif
+                            }
+                        }
+                    }), "v@:@@@@");
+                    
+                    class_addMethod(observerClass, @selector(rtmpPlaybackFinished:), imp_implementationWithBlock(^(id self, NSNotification *notification) {
+                        // 播放完毕，循环播放
+                        if (rtmpPlayer) {
+                            [rtmpPlayer seekToTime:kCMTimeZero];
+                            [rtmpPlayer play];
+                        }
+                    }), "v@:@");
+                    
+                    objc_registerClassPair(observerClass);
+                });
+                
+                // 创建观察者
+                id observer = [[observerClass alloc] init];
+                objc_setAssociatedObject(item, "VCPlayerObserver", observer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                
+                // 监听状态
+                [item addObserver:observer forKeyPath:@"status" options:NSKeyValueObservingOptionNew context:NULL];
+                [[NSNotificationCenter defaultCenter] addObserver:observer 
+                                                         selector:@selector(rtmpPlaybackFinished:) 
+                                                             name:AVPlayerItemDidPlayToEndTimeNotification 
+                                                           object:item];
+                
+                // 创建播放器
+                rtmpPlayer = [AVPlayer playerWithPlayerItem:item];
+                
+                // iOS 15+ 使用新的播放API
+                if (@available(iOS 15.0, *)) {
+                    rtmpPlayer.audiovisualBackgroundPlaybackPolicy = AVPlayerAudiovisualBackgroundPlaybackPolicyAutomatic;
+                }
+                
+                rtmpPlayer.automaticallyWaitsToMinimizeStalling = YES;
+                
+                // 开始播放
+                [rtmpPlayer play];
+                
+                // 标记为未就绪，等待回调确认
+                rtmpReady = NO;
+                
+                // 启动RTMP监控
+                vc_start_rtmp_monitor();
+                
+                // 添加通知监听网络状况变化
+                [[NSNotificationCenter defaultCenter] addObserver:NSObject.class 
+                                                      selector:@selector(handleNetworkChange:) 
+                                                          name:@"kNetworkReachabilityChangedNotification" 
+                                                        object:nil];
+                
+            } else {
+                #if DEBUG_LOG
+                NSLog(@"[VirtualCam] 无法加载RTMP资源: %@", error);
+                #endif
+                
+                // 错误处理和UI反馈
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    UIAlertController *errorAlert = [UIAlertController 
+                        alertControllerWithTitle:@"RTMP流加载失败" 
+                        message:[NSString stringWithFormat:@"无法加载视频流: %@", error.localizedDescription] 
+                        preferredStyle:UIAlertControllerStyleAlert];
+                    
+                    [errorAlert addAction:[UIAlertAction actionWithTitle:@"重试" 
+                        style:UIAlertActionStyleDefault 
+                        handler:^(UIAlertAction *action) {
+                            vc_start_rtmp_stream(urlString);
+                        }]];
+                    
+                    [errorAlert addAction:[UIAlertAction actionWithTitle:@"取消" 
+                        style:UIAlertActionStyleCancel 
+                        handler:nil]];
+                    
+                    [[UIWindow vc_keyWindow].rootViewController presentViewController:errorAlert animated:YES completion:nil];
+                });
+            }
+        });
+    }];
+}
+
+// MARK: - 帧率跟踪初始化
+static void vc_initialize_frame_tracking() {
+    originalFrameRate = 30; // 默认30fps
+    frameIntervalNanos = (uint64_t)(NSEC_PER_SEC / originalFrameRate);
+    lastFrameTimestamp = mach_absolute_time();
+    averageFrameInterval = (double)frameIntervalNanos / NSEC_PER_SEC;
+    frameCounter = 0;
+}
+
+// MARK: - 更新帧率统计
+static void vc_update_frame_stats(CMSampleBufferRef buffer) {
+    if (!buffer) return;
+    
+    uint64_t currentTime = mach_absolute_time();
+    uint64_t elapsedNanos = currentTime - lastFrameTimestamp;
+    
+    // 转换为秒
+    mach_timebase_info_data_t timebase;
+    mach_timebase_info(&timebase);
+    double elapsedSeconds = (double)elapsedNanos * timebase.numer / timebase.denom / NSEC_PER_SEC;
+    
+    // 更新平均帧间隔
+    frameCounter = (frameCounter + 1) % FRAME_STAT_WINDOW;
+    if (frameCounter == 0) {
+        // 每FRAME_STAT_WINDOW帧重新计算一次平均帧率
+        averageFrameInterval = (averageFrameInterval * (FRAME_STAT_WINDOW - 1) + elapsedSeconds) / FRAME_STAT_WINDOW;
+        originalFrameRate = (uint32_t)(1.0 / averageFrameInterval);
+        
+        // 更新帧间隔
+        frameIntervalNanos = (uint64_t)(NSEC_PER_SEC / originalFrameRate);
+        
+        #if DEBUG_LOG
+        NSLog(@"[VirtualCam] 当前帧率: %d fps", originalFrameRate);
+        #endif
+    }
+    
+    lastFrameTimestamp = currentTime;
+}
+
+// MARK: - 同步帧时间戳
+static CMSampleBufferRef vc_synchronize_frame_timestamp(CMSampleBufferRef buffer) {
+    if (!buffer) return buffer;
+    
+    // 获取原始时间信息
+    CMSampleTimingInfo timing;
+    CMSampleBufferGetSampleTimingInfo(buffer, 0, &timing);
+    
+    // 计算真实的帧间隔时间
+    CMTime frameInterval = CMTimeMake(1, originalFrameRate);
+    
+    // 基于当前时间创建新的时间戳
+    CMTime currentTime = CMTimeMakeWithSeconds(CACurrentMediaTime(), 600);
+    
+    // 更新时间信息
+    timing.presentationTimeStamp = currentTime;
+    timing.decodeTimeStamp = currentTime;
+    timing.duration = frameInterval;
+    
+    // 创建新Buffer
+    CMSampleBufferRef newBuffer = NULL;
+    CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, buffer, 1, &timing, &newBuffer);
+    
+    return newBuffer ?: buffer;
+}
+
+// MARK: - 获取设备真实EXIF数据
+static NSDictionary* vc_get_device_real_exif() {
+    NSMutableDictionary *exif = [NSMutableDictionary dictionary];
+    
+    // 1. 直接从设备获取基本信息
+    NSString *deviceModel = [[UIDevice currentDevice] model];
+    NSString *systemVersion = [[UIDevice currentDevice] systemVersion];
+    
+    // 2. 获取更精确的机型标识符
+    struct utsname systemInfo;
+    uname(&systemInfo);
+    //NSString *modelIdentifier = [NSString stringWithCString:systemInfo.machine encoding:NSUTF8StringEncoding];
+    
+    // 3. 使用AVCaptureDevice API获取相机实际信息
+    AVCaptureDevice *camera = nil;
+    if (@available(iOS 15.0, *)) {
+        AVCaptureDeviceDiscoverySession *discoverySession = [AVCaptureDeviceDiscoverySession 
+            discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
+            mediaType:AVMediaTypeVideo
+            position:AVCaptureDevicePositionBack];
+        camera = [discoverySession devices].firstObject;
+    } else {
+        camera = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+    }
+    
+    // 4. 从相机获取实际参数
+    if (camera) {
+        exif[(NSString*)kCGImagePropertyExifFNumber] = @(camera.lensAperture);
+        exif[(NSString*)kCGImagePropertyExifFocalLength] = @(camera.activeFormat.videoFieldOfView);
+        
+        // 设置ISO和曝光信息(使用相机当前设置)
+        if ([camera isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
+            exif[(NSString*)kCGImagePropertyExifISOSpeedRatings] = @[@(camera.ISO)];
+            exif[(NSString*)kCGImagePropertyExifExposureTime] = @(camera.exposureDuration.value / (double)camera.exposureDuration.timescale);
+        } else {
+            // 默认值
+            exif[(NSString*)kCGImagePropertyExifISOSpeedRatings] = @[@(100)];
+            exif[(NSString*)kCGImagePropertyExifExposureTime] = @(1.0/60.0);
+        }
+    }
+    
+    // 5. 设置厂商和设备信息
+    exif[(NSString*)kCGImagePropertyExifMake] = @"Apple";
+    exif[(NSString*)kCGImagePropertyExifModel] = deviceModel;
+    exif[(NSString*)kCGImagePropertyExifSoftware] = [NSString stringWithFormat:@"iOS %@", systemVersion];
+    
+    // 6. 动态时间戳
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"yyyy:MM:dd HH:mm:ss"];
+    [formatter setTimeZone:[NSTimeZone systemTimeZone]];
+    NSString *timestamp = [formatter stringFromDate:[NSDate date]];
+    exif[(NSString*)kCGImagePropertyExifDateTimeOriginal] = timestamp;
+    exif[(NSString*)kCGImagePropertyExifDateTimeDigitized] = timestamp;
+    
+    // 7. 获取GPS信息(如果有权限)
+    CLLocationManager *locationManager = [[CLLocationManager alloc] init];
+
+    if (locationManager.authorizationStatus == kCLAuthorizationStatusAuthorizedWhenInUse ||
+        locationManager.authorizationStatus == kCLAuthorizationStatusAuthorizedAlways) {
+        CLLocationManager *locationManager = [[CLLocationManager alloc] init];
+        CLLocation *location = locationManager.location;
+        
+        if (location) {
+            NSMutableDictionary *gpsDict = [NSMutableDictionary dictionary];
+            
+            // 格式化GPS坐标
+            CLLocationCoordinate2D coordinate = location.coordinate;
+            
+            gpsDict[(NSString*)kCGImagePropertyGPSLatitude] = @(fabs(coordinate.latitude));
+            gpsDict[(NSString*)kCGImagePropertyGPSLatitudeRef] = coordinate.latitude >= 0 ? @"N" : @"S";
+            gpsDict[(NSString*)kCGImagePropertyGPSLongitude] = @(fabs(coordinate.longitude));
+            gpsDict[(NSString*)kCGImagePropertyGPSLongitudeRef] = coordinate.longitude >= 0 ? @"E" : @"W";
+            gpsDict[(NSString*)kCGImagePropertyGPSAltitude] = @(location.altitude);
+            gpsDict[(NSString*)kCGImagePropertyGPSTimeStamp] = timestamp;
+            
+            exif[(NSString*)kCGImagePropertyGPSDictionary] = gpsDict;
+        }
+    }
+    
+    return [exif copy];
+}
+
+// MARK: - 获取EXIF数据
+static void vc_extract_real_exif() {
+    // 直接切换EXIF状态
+    if (useRealEXIF) {
+        // 关闭EXIF
+        useRealEXIF = NO;
+        globalEXIFData = nil;
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *disabledAlert = [UIAlertController 
+                alertControllerWithTitle:@"EXIF已关闭" 
+                message:@"不再向视频帧添加EXIF数据" 
+                preferredStyle:UIAlertControllerStyleAlert];
+            
+            [disabledAlert addAction:[UIAlertAction actionWithTitle:@"确定" 
+                style:UIAlertActionStyleDefault handler:nil]];
+            
+            [[UIWindow vc_keyWindow].rootViewController presentViewController:disabledAlert 
+                animated:YES completion:nil];
+        });
+    } else {
+        // 启用EXIF
+        globalEXIFData = vc_get_device_real_exif();
+        useRealEXIF = YES;
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *enabledAlert = [UIAlertController 
+                alertControllerWithTitle:@"EXIF已启用" 
+                message:@"使用当前设备的真实EXIF数据" 
+                preferredStyle:UIAlertControllerStyleAlert];
+            
+            [enabledAlert addAction:[UIAlertAction actionWithTitle:@"确定" 
+                style:UIAlertActionStyleDefault handler:nil]];
+            
+            [[UIWindow vc_keyWindow].rootViewController presentViewController:enabledAlert 
+                animated:YES completion:nil];
+        });
+    }
+}
+
+// MARK: - EXIF注入实现
+static CMSampleBufferRef vc_inject_exif(CMSampleBufferRef buffer) {
+    if (!buffer) return buffer;
+    
+    // 查找缓存的EXIF数据
+    NSDictionary *exifToUse = globalEXIFData;
+    if (!exifToUse) {
+        exifToUse = vc_get_device_real_exif();
+        globalEXIFData = exifToUse;
+    } else {
+        // 更新时间戳
+        NSMutableDictionary *updatedEXIF = [exifToUse mutableCopy];
+        
+        // 动态时间戳
+        NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+        [formatter setDateFormat:@"yyyy:MM:dd HH:mm:ss"];
+        [formatter setTimeZone:[NSTimeZone systemTimeZone]];
+        NSString *timestamp = [formatter stringFromDate:[NSDate date]];
+        
+        updatedEXIF[(NSString*)kCGImagePropertyExifDateTimeOriginal] = timestamp;
+        updatedEXIF[(NSString*)kCGImagePropertyExifDateTimeDigitized] = timestamp;
+        
+        if (updatedEXIF[(NSString*)kCGImagePropertyGPSDictionary]) {
+            NSMutableDictionary *gpsDict = [updatedEXIF[(NSString*)kCGImagePropertyGPSDictionary] mutableCopy];
+            gpsDict[(NSString*)kCGImagePropertyGPSTimeStamp] = timestamp;
+            updatedEXIF[(NSString*)kCGImagePropertyGPSDictionary] = gpsDict;
+        }
+        
+        exifToUse = updatedEXIF;
+        globalEXIFData = updatedEXIF;
+    }
+    
+    // 创建附件字典
+    CFMutableDictionaryRef attachments = CFDictionaryCreateMutable(kCFAllocatorDefault, 1, 
+                                                                &kCFTypeDictionaryKeyCallBacks, 
+                                                                &kCFTypeDictionaryValueCallBacks);
+    
+    // 添加EXIF数据
+    if (exifToUse) {
+        CFDictionarySetValue(attachments, kCGImagePropertyExifDictionary, (__bridge CFTypeRef)exifToUse);
+    }
+    
+    // 创建新Buffer
+    CMSampleBufferRef newBuffer = NULL;
+    MyCreateSampleBufferWithAttachments(buffer, attachments, &newBuffer);
+    
+    CFRelease(attachments);
+    return newBuffer ?: buffer;
+}
+
+// MARK: - 从RTMP获取当前帧
+static CMSampleBufferRef vc_get_rtmp_frame() {
+    if (!rtmpPlayer || !rtmpOutput || !rtmpReady) return NULL;
+    
+    // 检查播放状态
+    if (rtmpPlayer.timeControlStatus == AVPlayerTimeControlStatusPaused) {
+        [rtmpPlayer play];
+    }
+    
+    // 获取当前时间
+    CMTime currentTime = [rtmpPlayer currentTime];
+    
+    // 当缓冲区为空或正在缓冲时，尝试使用最后一帧
+    static CVPixelBufferRef lastValidBuffer = NULL;
+    
+    // 获取当前帧
+    CVPixelBufferRef pixelBuffer = [rtmpOutput copyPixelBufferForItemTime:currentTime itemTimeForDisplay:NULL];
+    
+    if (!pixelBuffer) {
+        // 使用上次的有效帧
+        if (lastValidBuffer) {
+            pixelBuffer = lastValidBuffer;
+            CFRetain(pixelBuffer); // 增加引用计数
+        } else {
+            return NULL;
+        }
+    } else {
+        // 更新最后一帧
+        if (lastValidBuffer) {
+            CVPixelBufferRelease(lastValidBuffer);
+        }
+        lastValidBuffer = pixelBuffer;
+        CFRetain(lastValidBuffer); // 增加引用计数
+    }
+    
+    // 创建视频信息
+    CMVideoFormatDescriptionRef formatDesc;
+    OSStatus status = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &formatDesc);
+    if (status != noErr) {
+        CVPixelBufferRelease(pixelBuffer);
+        return NULL;
+    }
+    
+    // 创建时间信息，使用原始帧率
+    CMSampleTimingInfo timing;
+    timing.duration = CMTimeMake(1, originalFrameRate > 0 ? originalFrameRate : 30);
+    timing.presentationTimeStamp = currentTime;
+    timing.decodeTimeStamp = currentTime;
+    
+    // 创建SampleBuffer
+    CMSampleBufferRef sampleBuffer;
+    status = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, NULL, NULL, 
+                                               formatDesc, &timing, &sampleBuffer);
+    
+    // 清理资源
+    CFRelease(formatDesc);
+    CVPixelBufferRelease(pixelBuffer);
+    
+    if (status != noErr) return NULL;
+    
+    // 注入EXIF (如果启用)
+    if (useRealEXIF && globalEXIFData) {
+        CMSampleBufferRef exifBuffer = vc_inject_exif(sampleBuffer);
+        CFRelease(sampleBuffer);
+        return exifBuffer;
+    }
+    
+    return sampleBuffer;
+}
+
+// MARK: - WebRTC优化的帧处理流程
+static CMSampleBufferRef vc_process_webrtc_frame(CMSampleBufferRef buffer) {
+    if (!buffer) return buffer;
+    
+    // 1. 更新帧率统计
+    vc_update_frame_stats(buffer);
+    
+    // 2. 处理视频帧(替换视频源、旋转等)
+    CMSampleBufferRef processedBuffer = vc_process_frame(buffer);
+    
+    // 3. 同步时间戳
+    CMSampleBufferRef synchronizedBuffer = vc_synchronize_frame_timestamp(processedBuffer);
+    
+    // 4. 注入EXIF数据
+    CMSampleBufferRef finalBuffer = NULL;
+    if (useRealEXIF && globalEXIFData) {
+        finalBuffer = vc_inject_exif(synchronizedBuffer);
+    } else {
+        finalBuffer = synchronizedBuffer;
+        if (synchronizedBuffer != processedBuffer) {
+            CFRetain(finalBuffer);
+        }
+    }
+    
+    // 5. 清理中间缓冲区
+    if (synchronizedBuffer != processedBuffer && synchronizedBuffer != finalBuffer) {
+        CFRelease(synchronizedBuffer);
+    }
+    if (processedBuffer != buffer && processedBuffer != finalBuffer) {
+        CFRelease(processedBuffer);
+    }
+    
+    return finalBuffer;
+}
+
+// MARK: - 视频处理核心
+static CMSampleBufferRef vc_process_frame(CMSampleBufferRef buffer) {
+    if (!virtualCameraEnabled) return buffer;
+    
+    // 根据数据源选择不同的处理方式
+    CMSampleBufferRef sourceBuffer = buffer;
+    BOOL needReleaseSourceBuffer = NO;
+    
+    switch (currentDataSource) {
+        case 1: // 本地视频
+            // 从缓存中获取最新一帧
+            for (int i = 0; i < BUFFER_CACHE_SIZE; i++) {
+                int index = (currentBufferIndex - 1 - i + BUFFER_CACHE_SIZE) % BUFFER_CACHE_SIZE;
+                if (cachedBuffers[index]) {
+                    sourceBuffer = cachedBuffers[index];
+                    CFRetain(sourceBuffer); // 增加引用计数
+                    needReleaseSourceBuffer = YES;
+                    break;
+                }
+            }
+            break;
+            
+        case 2: // RTMP流
+            {
+                // 从RTMP获取当前帧
+                CMSampleBufferRef rtmpBuffer = vc_get_rtmp_frame();
+                if (rtmpBuffer) {
+                    sourceBuffer = rtmpBuffer;
+                    needReleaseSourceBuffer = YES;
+                }
+            }
+            break;
+            
+        case 0: // 原生摄像头
+        default:
+            // 更新帧率统计
+            vc_update_frame_stats(buffer);
+            break;
+    }
+    
+    // 应用旋转
+    CMSampleBufferRef rotatedBuffer = NULL;
+    
+    if (rotationAngle != 0) {
+        CVPixelBufferRef srcBuffer = CMSampleBufferGetImageBuffer(sourceBuffer);
+        if (srcBuffer) {
+            // 锁定图像缓冲区
+            CVPixelBufferLockBaseAddress(srcBuffer, kCVPixelBufferLock_ReadOnly);
+            
+            // 获取图像尺寸
+            size_t srcWidth = CVPixelBufferGetWidth(srcBuffer);
+            size_t srcHeight = CVPixelBufferGetHeight(srcBuffer);
+            size_t srcBytesPerRow = CVPixelBufferGetBytesPerRow(srcBuffer);
+            
+            // 旋转后的尺寸
+            size_t dstWidth = (rotationAngle == 90 || rotationAngle == 270) ? srcHeight : srcWidth;
+            size_t dstHeight = (rotationAngle == 90 || rotationAngle == 270) ? srcWidth : srcHeight;
+            
+            // 创建目标缓冲区
+            CVPixelBufferRef dstBuffer = NULL;
+            NSDictionary *options = @{
+                (NSString*)kCVPixelBufferCGImageCompatibilityKey: @YES,
+                (NSString*)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+                (NSString*)kCVPixelBufferWidthKey: @(dstWidth),
+                (NSString*)kCVPixelBufferHeightKey: @(dstHeight)
+            };
+            
+            CVPixelBufferCreate(kCFAllocatorDefault, dstWidth, dstHeight, 
+                               kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)options, &dstBuffer);
+            
+            // 锁定目标缓冲区
+            CVPixelBufferLockBaseAddress(dstBuffer, 0);
+            
+            // 获取基址
+            uint8_t *srcData = (uint8_t *)CVPixelBufferGetBaseAddress(srcBuffer);
+            uint8_t *dstData = (uint8_t *)CVPixelBufferGetBaseAddress(dstBuffer);
+            size_t dstBytesPerRow = CVPixelBufferGetBytesPerRow(dstBuffer);
+            
+            // 高效旋转算法
+            size_t pixelSize = 4; // BGRA每像素4字节
+            
+            switch (rotationAngle) {
+                case 90:
+                    for (size_t y = 0; y < srcHeight; y++) {
+                        for (size_t x = 0; x < srcWidth; x++) {
+                            size_t srcOffset = y * srcBytesPerRow + x * pixelSize;
+                            size_t dstOffset = (dstHeight - 1 - x) * dstBytesPerRow + y * pixelSize;
+                            
+                            // 复制像素
+                            memcpy(dstData + dstOffset, srcData + srcOffset, pixelSize);
+                        }
+                    }
+                    break;
+                    
+                case 180:
+                    for (size_t y = 0; y < srcHeight; y++) {
+                        for (size_t x = 0; x < srcWidth; x++) {
+                            size_t srcOffset = y * srcBytesPerRow + x * pixelSize;
+                            size_t dstOffset = (dstHeight - 1 - y) * dstBytesPerRow + (dstWidth - 1 - x) * pixelSize;
+                            
+                            // 复制像素
+                            memcpy(dstData + dstOffset, srcData + srcOffset, pixelSize);
+                        }
+                    }
+                    break;
+                    
+                case 270:
+                    for (size_t y = 0; y < srcHeight; y++) {
+                        for (size_t x = 0; x < srcWidth; x++) {
+                            size_t srcOffset = y * srcBytesPerRow + x * pixelSize;
+                            size_t dstOffset = x * dstBytesPerRow + (dstWidth - 1 - y) * pixelSize;
+                            
+                            // 复制像素
+                            memcpy(dstData + dstOffset, srcData + srcOffset, pixelSize);
+                        }
+                    }
+                    break;
+                    
+                default:
+                    break;
+            }
+            
+            // 解锁缓冲区
+            CVPixelBufferUnlockBaseAddress(srcBuffer, kCVPixelBufferLock_ReadOnly);
+            CVPixelBufferUnlockBaseAddress(dstBuffer, 0);
+            
+            // 创建新视频格式描述
+            CMVideoFormatDescriptionRef videoDesc = NULL;
+            CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, dstBuffer, &videoDesc);
+            
+            // 获取时间信息
+            CMSampleTimingInfo timing;
+            CMSampleBufferGetSampleTimingInfo(sourceBuffer, 0, &timing);
+            
+            // 创建新样本缓冲区
+            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, dstBuffer, TRUE, NULL, NULL, 
+                                           videoDesc, &timing, &rotatedBuffer);
+            
+            // 释放资源
+            CFRelease(videoDesc);
+            CVPixelBufferRelease(dstBuffer);
+        }
+    }
+    
+    // 应用EXIF (如果需要)
+    CMSampleBufferRef finalBuffer = NULL;
+    if (useRealEXIF) {
+        if (rotatedBuffer) {
+            finalBuffer = vc_inject_exif(rotatedBuffer);
+            CFRelease(rotatedBuffer);
+        } else {
+            finalBuffer = vc_inject_exif(sourceBuffer);
+        }
+    } else {
+        if (rotatedBuffer) {
+            finalBuffer = rotatedBuffer;
+        } else {
+            finalBuffer = sourceBuffer;
+            if (sourceBuffer != buffer) {
+                CFRetain(finalBuffer);
+            }
+        }
+    }
+    
+    // 如果需要释放源缓冲区
+    if (needReleaseSourceBuffer) {
+        CFRelease(sourceBuffer);
+    }
+    
+    return finalBuffer;
+}
+
+// MARK: - 网络状态变化处理
+%hook NSObject
+
++ (void)handleNetworkChange:(NSNotification *)notification {
+    // 检查RTMP播放器状态
+    if (rtmpPlayer && !rtmpState.isConnected && lastRTMPURL) {
+        // 网络状态变化时尝试重连
+        vc_reconnect_rtmp_stream();
+    }
+}
+
+%end
+
+// MARK: - Hook 实现
+
+// 原生摄像头Hook
+%hook AVCaptureVideoDataOutput
+
+- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate 
+                        queue:(dispatch_queue_t)queue {
+    
+    // 创建代理类
+    static dispatch_once_t onceToken;
+    static Class proxyClass;
+    dispatch_once(&onceToken, ^{
+        proxyClass = objc_allocateClassPair([NSObject class], "VCDelegateProxy", 0);
+        class_addProtocol(proxyClass, @protocol(AVCaptureVideoDataOutputSampleBufferDelegate));
+        
+        // 实现代理方法
+        class_addMethod(proxyClass, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), imp_implementationWithBlock(^(id self, AVCaptureOutput *output, CMSampleBufferRef buffer, AVCaptureConnection *conn) {
+            
+            // 处理视频帧
+            CMSampleBufferRef processed = vc_process_frame(buffer);
+            
+            // 传递给原始代理
+            if ([delegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+                [delegate captureOutput:output didOutputSampleBuffer:processed fromConnection:conn];
+            }
+            
+            // 释放处理后的缓冲区(如果是新创建的)
+            if (processed != buffer) {
+                CFRelease(processed);
+            }
+        }), "v@:@@@");
+        
+        objc_registerClassPair(proxyClass);
+    });
+    
+    // 创建代理实例
+    id proxy = [[proxyClass alloc] init];
+    
+    // 保存原始代理对象(避免被释放)
+    objc_setAssociatedObject(proxy, "originalDelegate", delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    
+    // 调用原始方法，传入代理
+    %orig(proxy, queue);
+}
+
+%end
+
+// 检查WebRTC类是否存在
+static BOOL isWebRTCAvailable() {
+    return (objc_getClass("RTCCameraVideoCapturer") != nil);
+}
+
+%group WebRTCHooks
+%hook RTCCameraVideoCapturer
+
+- (void)captureOutput:(AVCaptureOutput *)captureOutput
+didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+       fromConnection:(AVCaptureConnection *)connection {
+    
+    // 使用WebRTC优化的帧处理流程
+    CMSampleBufferRef processed = virtualCameraEnabled ? vc_process_webrtc_frame(sampleBuffer) : sampleBuffer;
+    
+    // 调用原始方法
+    %orig(captureOutput, processed, connection);
+    
+    // 释放处理后的缓冲区(如果是新创建的)
+    if (processed != sampleBuffer) CFRelease(processed);
+}
+
+%end
+%end
+
+// 音量键监听
+%hook SBVolumeControl
+
+- (void)decreaseVolume {
+    NSLog(@"[VirtualCam] 检测到音量下键按下");
+    
+    static NSTimeInterval lastPressTime = 0;
+    static NSTimeInterval doublePressThreshold = 0.4; // 双击阈值时间（秒）
+    static BOOL isWaitingForSecondPress = NO;
+    
+    NSTimeInterval currentTime = [[NSDate date] timeIntervalSince1970];
+    NSTimeInterval timeDifference = currentTime - lastPressTime;
+    
+    NSLog(@"[VirtualCam] 时间差: %f, 等待状态: %d", timeDifference, isWaitingForSecondPress);
+    
+    if (isWaitingForSecondPress && timeDifference <= doublePressThreshold) {
+        // 检测到双击
+        NSLog(@"[VirtualCam] 检测到双击，显示菜单");
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            vc_show_menu_controller();
+        });
+        
+        // 重置状态
+        isWaitingForSecondPress = NO;
+        lastPressTime = 0;
+    } else {
+        // 记录首次按下
+        lastPressTime = currentTime;
+        isWaitingForSecondPress = YES;
+        
+        // 设置超时重置
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(doublePressThreshold * 1.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (isWaitingForSecondPress) {
+                NSLog(@"[VirtualCam] 等待超时，重置状态");
+                isWaitingForSecondPress = NO;
+            }
+        });
+    }
+    
+    %orig;
+}
+
+%end
+
+%ctor {
+    // 初始化视频处理队列
+    //videoProcessingQueue = dispatch_queue_create("com.virtualcam.processing", DISPATCH_QUEUE_SERIAL);
+    if (!videoProcessingQueue) {
+    videoProcessingQueue = dispatch_queue_create("com.virtualcam.processing", DISPATCH_QUEUE_SERIAL);
+}
+    // 初始化缓存
+    for (int i = 0; i < BUFFER_CACHE_SIZE; i++) {
+        cachedBuffers[i] = NULL;
+    }
+    
+    // 初始化摄像头属性字典
+    cameraProperties = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, 
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    
+    // 初始化帧率跟踪
+    vc_initialize_frame_tracking();
+    
+    // 按需初始化Hook
+    // 按需初始化Hook
+    %init(SBVolumeControl=objc_getClass("SBVolumeControl"),
+          AVCaptureVideoDataOutput=objc_getClass("AVCaptureVideoDataOutput"));
+    
+    // 有条件地初始化WebRTC Hook
+    if (isWebRTCAvailable()) {
+        %init(WebRTCHooks);
+        #if DEBUG_LOG
+        NSLog(@"[VirtualCam] WebRTC Hook已加载");
+        #endif
+    }
+          
+    #if DEBUG_LOG
+    NSLog(@"[VirtualCam] Tweak已加载, iOS版本: %@", [[UIDevice currentDevice] systemVersion]);
+    #endif
+}
